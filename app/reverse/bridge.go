@@ -4,11 +4,11 @@ import (
 	"context"
 	"time"
 
-	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
@@ -52,6 +52,11 @@ func (b *Bridge) cleanup() {
 	for _, w := range b.workers {
 		if w.IsActive() {
 			activeWorkers = append(activeWorkers, w)
+		}
+		if w.Closed() {
+			if w.Timer != nil {
+				w.Timer.SetTimeout(0)
+			}
 		}
 	}
 
@@ -98,6 +103,7 @@ type BridgeWorker struct {
 	Worker     *mux.ServerWorker
 	Dispatcher routing.Dispatcher
 	State      Control_State
+	Timer      *signal.ActivityTimer
 }
 
 func NewBridgeWorker(domain string, tag string, d routing.Dispatcher) (*BridgeWorker, error) {
@@ -125,6 +131,10 @@ func NewBridgeWorker(domain string, tag string, d routing.Dispatcher) (*BridgeWo
 	}
 	w.Worker = worker
 
+	terminate := func() {
+		worker.Close()
+	}
+	w.Timer = signal.CancelAfterInactivity(ctx, terminate, 60*time.Second)
 	return w, nil
 }
 
@@ -144,6 +154,10 @@ func (w *BridgeWorker) IsActive() bool {
 	return w.State == Control_ACTIVE && !w.Worker.Closed()
 }
 
+func (w *BridgeWorker) Closed() bool {
+	return w.Worker.Closed()
+}
+
 func (w *BridgeWorker) Connections() uint32 {
 	return w.Worker.ActiveConnections()
 }
@@ -153,13 +167,26 @@ func (w *BridgeWorker) handleInternalConn(link *transport.Link) {
 	for {
 		mb, err := reader.ReadMultiBuffer()
 		if err != nil {
-			break
+			if w.Timer != nil {
+				if w.Closed() {
+					w.Timer.SetTimeout(0)
+				} else {
+					w.Timer.SetTimeout(24 * time.Hour)
+				}
+			}
+			return
+		}
+		if w.Timer != nil {
+			w.Timer.Update()
 		}
 		for _, b := range mb {
 			var ctl Control
 			if err := proto.Unmarshal(b.Bytes(), &ctl); err != nil {
 				errors.LogInfoInner(context.Background(), err, "failed to parse proto message")
-				break
+				if w.Timer != nil {
+					w.Timer.SetTimeout(0)
+				}
+				return
 			}
 			if ctl.State != w.State {
 				w.State = ctl.State
@@ -170,9 +197,11 @@ func (w *BridgeWorker) handleInternalConn(link *transport.Link) {
 
 func (w *BridgeWorker) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
 	if !isInternalDomain(dest) {
-		ctx = session.ContextWithInbound(ctx, &session.Inbound{
-			Tag: w.Tag,
-		})
+		if session.InboundFromContext(ctx) == nil {
+			ctx = session.ContextWithInbound(ctx, &session.Inbound{
+				Tag: w.Tag,
+			})
+		}
 		return w.Dispatcher.Dispatch(ctx, dest)
 	}
 
@@ -193,13 +222,17 @@ func (w *BridgeWorker) Dispatch(ctx context.Context, dest net.Destination) (*tra
 
 func (w *BridgeWorker) DispatchLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
 	if !isInternalDomain(dest) {
-		ctx = session.ContextWithInbound(ctx, &session.Inbound{
-			Tag: w.Tag,
-		})
+		if session.InboundFromContext(ctx) == nil {
+			ctx = session.ContextWithInbound(ctx, &session.Inbound{
+				Tag: w.Tag,
+			})
+		}
 		return w.Dispatcher.DispatchLink(ctx, dest, link)
 	}
 
-	link = w.Dispatcher.(*dispatcher.DefaultDispatcher).WrapLink(ctx, link)
+	if d, ok := w.Dispatcher.(routing.WrapLinkDispatcher); ok {
+		link = d.WrapLink(ctx, link)
+	}
 	w.handleInternalConn(link)
 
 	return nil
